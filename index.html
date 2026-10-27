@@ -1,0 +1,817 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>划破天际</title>
+  <style>
+    :root {
+      color-scheme: dark;
+      --ink: #f4efe4;
+    }
+
+    * { box-sizing: border-box; }
+
+    html, body {
+      margin: 0;
+      height: 100%;
+      background: #05060f;
+      overflow: hidden;
+      font-family: "WenQuanYi Micro Hei", "Droid Sans Fallback", "PingFang SC", "Noto Sans SC", sans-serif;
+    }
+
+    canvas {
+      position: fixed;
+      inset: 0;
+      width: 100%;
+      height: 100%;
+      display: block;
+    }
+
+    #flash {
+      position: fixed;
+      inset: 0;
+      pointer-events: none;
+      background: #fff8ee;
+      opacity: 0;
+      mix-blend-mode: screen;
+    }
+
+    #vignette {
+      position: fixed;
+      inset: 0;
+      pointer-events: none;
+      background:
+        radial-gradient(ellipse at center, transparent 42%, rgba(0, 0, 0, 0.58) 100%),
+        linear-gradient(to top, rgba(0, 0, 0, 0.35), transparent 28%);
+    }
+
+    .hud {
+      position: fixed;
+      left: 0;
+      right: 0;
+      bottom: max(28px, env(safe-area-inset-bottom));
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      gap: 14px;
+      pointer-events: none;
+      z-index: 2;
+    }
+
+    .title {
+      margin: 0;
+      color: var(--ink);
+      font-size: clamp(28px, 5vw, 56px);
+      font-weight: 500;
+      letter-spacing: 0.48em;
+      text-indent: 0.48em;
+      text-shadow: 0 0 24px rgba(180, 210, 255, 0.45), 0 8px 30px rgba(0, 0, 0, 0.55);
+      opacity: 0;
+      transform: translateY(10px);
+      transition: opacity 0.8s ease, transform 0.8s ease;
+    }
+
+    .title.show {
+      opacity: 1;
+      transform: none;
+    }
+
+    button {
+      pointer-events: auto;
+      appearance: none;
+      border: 1px solid rgba(244, 239, 228, 0.38);
+      background: rgba(6, 8, 18, 0.42);
+      color: var(--ink);
+      letter-spacing: 0.28em;
+      text-indent: 0.28em;
+      font: inherit;
+      font-size: 14px;
+      padding: 12px 22px;
+      min-height: 44px;
+      border-radius: 999px;
+      cursor: pointer;
+      backdrop-filter: blur(8px);
+    }
+
+    button:hover,
+    button:focus-visible {
+      border-color: rgba(255, 244, 220, 0.85);
+      outline: none;
+      box-shadow: 0 0 0 3px rgba(160, 200, 255, 0.25);
+    }
+
+    @media (prefers-reduced-motion: reduce) {
+      .title { transition: none; }
+    }
+  </style>
+</head>
+<body>
+  <canvas id="sky"></canvas>
+  <div id="flash"></div>
+  <div id="vignette"></div>
+  <div class="hud">
+    <h1 class="title" id="title">划破天际</h1>
+    <button id="again" type="button">再斩一剑</button>
+  </div>
+
+  <script>
+    const canvas = document.getElementById("sky");
+    const ctx = canvas.getContext("2d", { alpha: false });
+    const sky = document.createElement("canvas");
+    const sctx = sky.getContext("2d", { alpha: false });
+    const flashEl = document.getElementById("flash");
+    const titleEl = document.getElementById("title");
+
+    const reduceMotion = matchMedia("(prefers-reduced-motion: reduce)").matches;
+    const SLASH_MS = reduceMotion ? 1600 : 420;
+    const HOLD_MS = reduceMotion ? 1600 : 2600;
+    const HEAL_MS = 1500;
+
+    const rand = (a, b) => a + Math.random() * (b - a);
+    const clamp = (v, a, b) => Math.max(a, Math.min(b, v));
+    const easeOutExpo = (t) => (t >= 1 ? 1 : 1 - 2 ** (-10 * t));
+    const easeInOut = (t) => (t < 0.5 ? 2 * t * t : 1 - ((-2 * t + 2) ** 2) / 2);
+
+    let w = 1;
+    let h = 1;
+    let dpr = 1;
+    let columns = [];
+    let stars = [];
+    let phase = "calm";
+    let phaseStart = performance.now();
+    let head = 0;
+    let open = 0;
+    let particles = [];
+    let shake = 0;
+    let soundArmed = false;
+    let audioCtx = null;
+    let noiseBuffer = null;
+
+    const cracks = [
+      { t: 0.16, dir: -1, len: 0.11, bend: -0.4 },
+      { t: 0.28, dir: 1, len: 0.09, bend: 0.35 },
+      { t: 0.41, dir: -1, len: 0.14, bend: 0.2 },
+      { t: 0.55, dir: 1, len: 0.1, bend: -0.45 },
+      { t: 0.67, dir: -1, len: 0.08, bend: 0.15 },
+      { t: 0.78, dir: 1, len: 0.12, bend: 0.4 },
+      { t: 0.9, dir: -1, len: 0.07, bend: -0.2 }
+    ];
+
+    function curve(t) {
+      const p0 = { x: -0.08 * w, y: h * 0.6 };
+      const p1 = { x: w * 0.22, y: h * 0.18 };
+      const p2 = { x: w * 0.68, y: h * 0.46 };
+      const p3 = { x: w * 1.08, y: h * 0.24 };
+      const u = 1 - t;
+      return {
+        x: u ** 3 * p0.x + 3 * u ** 2 * t * p1.x + 3 * u * t ** 2 * p2.x + t ** 3 * p3.x,
+        y: u ** 3 * p0.y + 3 * u ** 2 * t * p1.y + 3 * u * t ** 2 * p2.y + t ** 3 * p3.y
+      };
+    }
+
+    function tangent(t) {
+      const d = 0.001;
+      const a = curve(clamp(t - d, 0, 1));
+      const b = curve(clamp(t + d, 0, 1));
+      return { x: b.x - a.x, y: b.y - a.y };
+    }
+
+    function makeStars() {
+      const count = Math.round((w * h) / 9000);
+      stars = Array.from({ length: count }, () => ({
+        x: Math.random() * w,
+        y: Math.random() * h * 0.86,
+        r: Math.random() < 0.08 ? rand(1.6, 2.6) * dpr : rand(0.4, 1.3) * dpr,
+        p: Math.random() * Math.PI * 2,
+        flare: Math.random() < 0.045
+      }));
+    }
+
+    function buildColumns() {
+      const samples = [];
+      for (let i = 0; i <= 360; i++) {
+        const t = i / 360;
+        const p = curve(t);
+        samples.push({ t, x: p.x, y: p.y });
+      }
+      columns = new Array(w);
+      let s = 0;
+      for (let x = 0; x < w; x++) {
+        while (s < samples.length - 2 && samples[s + 1].x < x) s++;
+        const a = samples[s];
+        const b = samples[Math.min(s + 1, samples.length - 1)];
+        const span = b.x - a.x || 1;
+        const u = clamp((x - a.x) / span, 0, 1);
+        const minX = samples[0].x;
+        const maxX = samples[samples.length - 1].x;
+        if (x < minX || x > maxX) {
+          columns[x] = null;
+          continue;
+        }
+        columns[x] = {
+          t: a.t + (b.t - a.t) * u,
+          y: a.y + (b.y - a.y) * u
+        };
+      }
+    }
+
+    function resize() {
+      dpr = Math.min(window.devicePixelRatio || 1, 2);
+      w = Math.max(2, Math.floor(innerWidth * dpr));
+      h = Math.max(2, Math.floor(innerHeight * dpr));
+      canvas.width = w;
+      canvas.height = h;
+      sky.width = w;
+      sky.height = h;
+      makeStars();
+      buildColumns();
+    }
+
+    function drawSky(time) {
+      const g = sctx.createLinearGradient(0, 0, 0, h);
+      g.addColorStop(0, "#07091a");
+      g.addColorStop(0.42, "#17284f");
+      g.addColorStop(0.72, "#3a2a58");
+      g.addColorStop(1, "#6a3d42");
+      sctx.fillStyle = g;
+      sctx.fillRect(0, 0, w, h);
+
+      sctx.save();
+      sctx.translate(w * 0.58, h * 0.4);
+      sctx.rotate(-0.55);
+      const band = sctx.createLinearGradient(0, -h * 0.08, 0, h * 0.08);
+      band.addColorStop(0, "rgba(0,0,0,0)");
+      band.addColorStop(0.5, "rgba(190, 210, 255, 0.16)");
+      band.addColorStop(1, "rgba(0,0,0,0)");
+      sctx.fillStyle = band;
+      sctx.fillRect(-w, -h * 0.12, w * 2, h * 0.24);
+      sctx.restore();
+
+      const nebula = [
+        { x: 0.2, y: 0.3, r: 0.28, c: "rgba(90, 140, 255, 0.16)" },
+        { x: 0.78, y: 0.22, r: 0.22, c: "rgba(255, 90, 70, 0.12)" },
+        { x: 0.5, y: 0.55, r: 0.2, c: "rgba(255, 210, 150, 0.06)" }
+      ];
+      for (const n of nebula) {
+        const cx = n.x * w + Math.sin(time * 0.00008 + n.x) * 20;
+        const cy = n.y * h;
+        const rg = sctx.createRadialGradient(cx, cy, 0, cx, cy, n.r * w);
+        rg.addColorStop(0, n.c);
+        rg.addColorStop(1, "rgba(0,0,0,0)");
+        sctx.fillStyle = rg;
+        sctx.fillRect(cx - n.r * w, cy - n.r * w, n.r * w * 2, n.r * w * 2);
+      }
+
+      for (const star of stars) {
+        const tw = 0.45 + 0.55 * (0.5 + 0.5 * Math.sin(time * 0.002 + star.p));
+        sctx.globalAlpha = tw;
+        sctx.fillStyle = "#f7f4ff";
+        sctx.beginPath();
+        sctx.arc(star.x, star.y, star.r, 0, Math.PI * 2);
+        sctx.fill();
+        if (star.flare) {
+          sctx.globalAlpha = tw * 0.7;
+          sctx.strokeStyle = "rgba(255,255,255,0.8)";
+          sctx.lineWidth = Math.max(1, dpr);
+          sctx.beginPath();
+          sctx.moveTo(star.x - star.r * 4, star.y);
+          sctx.lineTo(star.x + star.r * 4, star.y);
+          sctx.moveTo(star.x, star.y - star.r * 4);
+          sctx.lineTo(star.x, star.y + star.r * 4);
+          sctx.stroke();
+        }
+      }
+      sctx.globalAlpha = 1;
+
+      const moonX = w * 0.8;
+      const moonY = h * 0.16;
+      const moonR = Math.min(w, h) * 0.055;
+      const glow = sctx.createRadialGradient(moonX, moonY, moonR * 0.4, moonX, moonY, moonR * 4.2);
+      glow.addColorStop(0, "rgba(255, 246, 224, 0.42)");
+      glow.addColorStop(1, "rgba(255, 246, 224, 0)");
+      sctx.fillStyle = glow;
+      sctx.beginPath();
+      sctx.arc(moonX, moonY, moonR * 4.2, 0, Math.PI * 2);
+      sctx.fill();
+      const body = sctx.createRadialGradient(moonX - moonR * 0.35, moonY - moonR * 0.35, moonR * 0.2, moonX, moonY, moonR);
+      body.addColorStop(0, "#fffaf1");
+      body.addColorStop(1, "#d5ccbe");
+      sctx.fillStyle = body;
+      sctx.beginPath();
+      sctx.arc(moonX, moonY, moonR, 0, Math.PI * 2);
+      sctx.fill();
+      sctx.fillStyle = "rgba(110, 102, 92, 0.2)";
+      sctx.beginPath();
+      sctx.arc(moonX + moonR * 0.22, moonY + moonR * 0.12, moonR * 0.2, 0, Math.PI * 2);
+      sctx.fill();
+      sctx.beginPath();
+      sctx.arc(moonX - moonR * 0.28, moonY + moonR * 0.02, moonR * 0.1, 0, Math.PI * 2);
+      sctx.fill();
+
+      const clouds = [
+        { x: 0.12, y: 0.4, s: 0.00002, rx: 0.24, ry: 0.055, a: 0.07 },
+        { x: 0.48, y: 0.58, s: 0.000014, rx: 0.3, ry: 0.05, a: 0.06 },
+        { x: 0.78, y: 0.36, s: 0.000018, rx: 0.2, ry: 0.045, a: 0.055 },
+        { x: 0.3, y: 0.7, s: 0.000016, rx: 0.26, ry: 0.04, a: 0.05 }
+      ];
+      for (const c of clouds) {
+        const cx = ((c.x + time * c.s) % 1.4 - 0.2) * w;
+        const cy = c.y * h;
+        sctx.save();
+        sctx.translate(cx, cy);
+        sctx.scale(c.rx * w, c.ry * h);
+        const cg = sctx.createRadialGradient(0, 0, 0.2, 0, 0, 1);
+        cg.addColorStop(0, `rgba(255,255,255,${c.a})`);
+        cg.addColorStop(1, "rgba(255,255,255,0)");
+        sctx.fillStyle = cg;
+        sctx.beginPath();
+        sctx.arc(0, 0, 1, 0, Math.PI * 2);
+        sctx.fill();
+        sctx.restore();
+      }
+    }
+
+    function gapFor(t) {
+      if (head <= 0 || t > head) return 0;
+      const behind = clamp((head - t) / 0.05, 0, 1);
+      const maxGap = h * (reduceMotion ? 0.016 : 0.03);
+      return maxGap * open * behind;
+    }
+
+    function tearAt(x, col) {
+      const gap = gapFor(col.t);
+      const rough = (Math.sin(x * 0.012) * 0.7 + Math.sin(x * 0.031) * 0.3) * gap * 0.18;
+      const cut = clamp(col.y + rough, 1, h - 1);
+      return { gap, cut };
+    }
+
+    function paintRift(time, overlay) {
+      if (head <= 0.001 || open <= 0.001) return;
+      const end = curve(head);
+      const start = curve(0);
+      ctx.save();
+      ctx.lineCap = "round";
+      ctx.lineJoin = "round";
+      if (!overlay) {
+        const core = ctx.createLinearGradient(start.x, start.y, end.x, end.y);
+        core.addColorStop(0, "rgba(210, 236, 255, 0.2)");
+        core.addColorStop(0.35, "rgba(255, 248, 230, 1)");
+        core.addColorStop(0.7, "rgba(255, 186, 140, 0.95)");
+        core.addColorStop(1, "rgba(255, 120, 90, 0.3)");
+        ctx.strokeStyle = core;
+        ctx.lineWidth = h * 0.09;
+        ctx.beginPath();
+        traceCurve(0, head);
+        ctx.stroke();
+        ctx.restore();
+        return;
+      }
+
+      ctx.globalCompositeOperation = "lighter";
+      const glow = ctx.createLinearGradient(start.x, start.y, end.x, end.y);
+      glow.addColorStop(0, "rgba(120, 190, 255, 0)");
+      glow.addColorStop(0.25, `rgba(150, 210, 255, ${0.28 * open})`);
+      glow.addColorStop(0.55, `rgba(255, 236, 200, ${0.4 * open})`);
+      glow.addColorStop(1, "rgba(255, 90, 60, 0)");
+      ctx.strokeStyle = glow;
+      ctx.lineWidth = h * 0.028 * open;
+      ctx.beginPath();
+      traceCurve(0, head);
+      ctx.stroke();
+      ctx.lineWidth = Math.max(1.5, dpr * 1.25);
+      ctx.strokeStyle = `rgba(255, 252, 245, ${0.9 * open})`;
+      ctx.shadowColor = "rgba(255, 236, 210, 0.95)";
+      ctx.shadowBlur = 18 * dpr;
+      ctx.beginPath();
+      traceCurve(0, head);
+      ctx.stroke();
+      ctx.restore();
+
+      if (phase === "hold" || phase === "heal") {
+        ctx.save();
+        ctx.globalCompositeOperation = "lighter";
+        for (let i = 0; i < 4; i++) {
+          const p = curve(0.2 + i * 0.18);
+          const radius = h * (0.16 + i * 0.03);
+          const g = ctx.createRadialGradient(p.x, p.y, 0, p.x, p.y, radius);
+          g.addColorStop(0, "rgba(255, 244, 220, 0.22)");
+          g.addColorStop(1, "rgba(255, 244, 220, 0)");
+          ctx.fillStyle = g;
+          ctx.fillRect(p.x - radius, p.y - radius, radius * 2, radius * 2);
+        }
+        ctx.restore();
+      }
+    }
+
+    function traceCurve(t0, t1) {
+      const steps = 48;
+      for (let i = 0; i <= steps; i++) {
+        const t = t0 + (t1 - t0) * (i / steps);
+        const p = curve(t);
+        if (i === 0) ctx.moveTo(p.x, p.y);
+        else ctx.lineTo(p.x, p.y);
+      }
+    }
+
+    function drawTornSky() {
+      const step = 2;
+      for (let x = 0; x < w; x += step) {
+        const sw = Math.min(step, w - x);
+        const dw = sw + 1;
+        const col = columns[x];
+        if (!col) {
+          ctx.drawImage(sky, x, 0, sw, h, x, 0, dw, h);
+          continue;
+        }
+        const { gap, cut } = tearAt(x, col);
+        const upH = Math.max(1, cut);
+        ctx.drawImage(sky, x, 0, sw, upH, x, -gap, dw, upH);
+        const lowH = Math.max(1, h - cut);
+        ctx.drawImage(sky, x, cut, sw, lowH, x, cut + gap, dw, lowH);
+      }
+    }
+
+    function edgePath(sign) {
+      let started = false;
+      ctx.beginPath();
+      for (let x = 0; x < w; x += 3) {
+        const col = columns[x];
+        if (!col || col.t > head) continue;
+        const { gap, cut } = tearAt(x, col);
+        const y = cut + sign * gap;
+        if (!started) {
+          ctx.moveTo(x, y);
+          started = true;
+        } else ctx.lineTo(x, y);
+      }
+    }
+
+    function drawEdges() {
+      if (head < 0.02) return;
+      ctx.save();
+      ctx.lineCap = "round";
+      ctx.lineJoin = "round";
+      ctx.lineWidth = Math.max(2, dpr * 2.2);
+      ctx.strokeStyle = "rgba(8, 6, 16, 0.55)";
+      edgePath(-1);
+      ctx.stroke();
+      edgePath(1);
+      ctx.stroke();
+      ctx.globalCompositeOperation = "lighter";
+      ctx.lineWidth = Math.max(1, dpr);
+      edgePath(-1);
+      ctx.strokeStyle = "rgba(170, 225, 255, 0.9)";
+      ctx.stroke();
+      edgePath(1);
+      ctx.strokeStyle = "rgba(255, 110, 80, 0.85)";
+      ctx.stroke();
+      ctx.restore();
+    }
+
+    function drawCracks() {
+      ctx.save();
+      ctx.globalCompositeOperation = "lighter";
+      ctx.lineCap = "round";
+      for (const crack of cracks) {
+        if (head < crack.t) continue;
+        const grow = clamp((head - crack.t) / 0.08, 0, 1) * open;
+        const origin = curve(crack.t);
+        const tan = tangent(crack.t);
+        const len = Math.hypot(tan.x, tan.y) || 1;
+        const nx = (-tan.y / len) * crack.dir;
+        const ny = (tan.x / len) * crack.dir;
+        const reach = crack.len * Math.min(w, h) * grow;
+        ctx.strokeStyle = `rgba(255, 244, 230, ${0.75 * grow})`;
+        ctx.lineWidth = Math.max(1, dpr * 1.4);
+        ctx.beginPath();
+        ctx.moveTo(origin.x, origin.y);
+        ctx.quadraticCurveTo(
+          origin.x + nx * reach * 0.55 + tan.x / len * reach * crack.bend,
+          origin.y + ny * reach * 0.55 + tan.y / len * reach * crack.bend,
+          origin.x + nx * reach,
+          origin.y + ny * reach
+        );
+        ctx.stroke();
+      }
+      ctx.restore();
+    }
+
+    function drawBlade() {
+      if (phase !== "slash" && phase !== "charge") return;
+      const tail = phase === "charge" ? 0 : Math.max(0, head - 0.22);
+      const tipT = phase === "charge" ? 0 : head;
+      const tip = curve(tipT);
+      ctx.save();
+      ctx.globalCompositeOperation = "lighter";
+      ctx.lineCap = "round";
+      if (phase === "slash" && head > 0.01) {
+        const grad = ctx.createLinearGradient(curve(tail).x, curve(tail).y, tip.x, tip.y);
+        grad.addColorStop(0, "rgba(255,255,255,0)");
+        grad.addColorStop(0.45, "rgba(120, 190, 255, 0.35)");
+        grad.addColorStop(0.82, "rgba(255, 220, 170, 0.75)");
+        grad.addColorStop(1, "rgba(255,255,255,0.95)");
+        ctx.strokeStyle = grad;
+        ctx.lineWidth = 22 * dpr;
+        ctx.beginPath();
+        traceCurve(tail, head);
+        ctx.stroke();
+        ctx.lineWidth = 4 * dpr;
+        ctx.strokeStyle = "rgba(255,255,255,0.95)";
+        ctx.shadowColor = "#fff";
+        ctx.shadowBlur = 18 * dpr;
+        ctx.beginPath();
+        traceCurve(tail, head);
+        ctx.stroke();
+      }
+
+      const tan = tangent(tipT);
+      const mag = Math.hypot(tan.x, tan.y) || 1;
+      const ux = tan.x / mag;
+      const uy = tan.y / mag;
+      const px = -uy;
+      const py = ux;
+      if (phase === "charge") {
+        const charge = clamp((performance.now() - phaseStart) / 520, 0, 1);
+        const visible = curve(0.08);
+        const radius = (12 + charge * 36) * dpr;
+        const g = ctx.createRadialGradient(visible.x, visible.y, 0, visible.x, visible.y, radius);
+        g.addColorStop(0, `rgba(255,255,255,${0.85 * charge})`);
+        g.addColorStop(0.4, `rgba(170, 220, 255, ${0.35 * charge})`);
+        g.addColorStop(1, "rgba(255,255,255,0)");
+        ctx.fillStyle = g;
+        ctx.fillRect(visible.x - radius, visible.y - radius, radius * 2, radius * 2);
+        ctx.restore();
+        return;
+      }
+
+      const L = 58 * dpr;
+      ctx.shadowBlur = 24 * dpr;
+      ctx.shadowColor = "rgba(200, 230, 255, 0.9)";
+      ctx.fillStyle = "#fff";
+      ctx.beginPath();
+      ctx.moveTo(tip.x + ux * L, tip.y + uy * L);
+      ctx.lineTo(tip.x + px * 6 * dpr, tip.y + py * 6 * dpr);
+      ctx.lineTo(tip.x - ux * L * 0.28, tip.y - uy * L * 0.28);
+      ctx.lineTo(tip.x - px * 6 * dpr, tip.y - py * 6 * dpr);
+      ctx.closePath();
+      ctx.fill();
+      ctx.restore();
+    }
+
+    function spawnAlong(from, to) {
+      const n = 10;
+      for (let i = 0; i < n; i++) {
+        const t = from + (to - from) * Math.random();
+        const p = curve(clamp(t, 0, 1));
+        const tan = tangent(t);
+        const mag = Math.hypot(tan.x, tan.y) || 1;
+        const speed = rand(0.15, 0.85) * dpr;
+        particles.push({
+          x: p.x,
+          y: p.y,
+          vx: (tan.x / mag) * speed * rand(-0.2, 1) + rand(-0.4, 0.4) * dpr,
+          vy: (tan.y / mag) * speed * rand(-0.2, 1) + rand(-0.5, 0.15) * dpr,
+          life: rand(280, 900),
+          age: 0,
+          size: rand(0.8, 2.4) * dpr,
+          color: Math.random() < 0.5 ? "190, 220, 255" : "255, 190, 140"
+        });
+      }
+    }
+
+    function spawnEmbers() {
+      if (particles.length > 240) return;
+      for (let i = 0; i < 3; i++) {
+        const t = Math.random() * Math.max(head, 0.01);
+        const p = curve(t);
+        particles.push({
+          x: p.x + rand(-4, 4) * dpr,
+          y: p.y,
+          vx: rand(-0.08, 0.08) * dpr,
+          vy: rand(-0.35, -0.08) * dpr,
+          life: rand(700, 1400),
+          age: 0,
+          size: rand(0.7, 1.8) * dpr,
+          color: Math.random() < 0.5 ? "255, 220, 180" : "160, 210, 255"
+        });
+      }
+    }
+
+    function drawParticles(dt) {
+      const next = [];
+      ctx.save();
+      ctx.globalCompositeOperation = "lighter";
+      for (const p of particles) {
+        p.age += dt;
+        if (p.age >= p.life) continue;
+        p.x += p.vx * dt * 0.06;
+        p.y += p.vy * dt * 0.06;
+        const a = 1 - p.age / p.life;
+        ctx.fillStyle = `rgba(${p.color}, ${a})`;
+        ctx.beginPath();
+        ctx.arc(p.x, p.y, p.size * a, 0, Math.PI * 2);
+        ctx.fill();
+        next.push(p);
+      }
+      ctx.restore();
+      particles = next;
+    }
+
+    function drawGround() {
+      const base = h * 0.78;
+      const fog = ctx.createLinearGradient(0, base - h * 0.08, 0, h);
+      fog.addColorStop(0, "rgba(20, 12, 24, 0)");
+      fog.addColorStop(0.35, "rgba(18, 12, 22, 0.35)");
+      fog.addColorStop(1, "rgba(5, 4, 10, 0.92)");
+      ctx.fillStyle = fog;
+      ctx.fillRect(0, base - h * 0.08, w, h);
+
+      function ridge(yBase, amp, freq, color) {
+        ctx.beginPath();
+        ctx.moveTo(0, h);
+        for (let x = 0; x <= w; x += 8) {
+          const y = yBase
+            + Math.sin(x * freq + 1.2) * amp
+            + Math.sin(x * freq * 2.3 + 0.4) * amp * 0.35;
+          ctx.lineTo(x, y);
+        }
+        ctx.lineTo(w, h);
+        ctx.closePath();
+        ctx.fillStyle = color;
+        ctx.fill();
+      }
+      ridge(h * 0.84, h * 0.035, 0.0045, "#14111c");
+      ridge(h * 0.9, h * 0.028, 0.0065, "#09080f");
+    }
+
+    function enter(next) {
+      const prev = phase;
+      phase = next;
+      phaseStart = performance.now();
+      if (next === "slash" && soundArmed) playSlash();
+      if (next === "hold" && prev === "slash") {
+        flash(reduceMotion ? 0.16 : 0.78);
+        shake = reduceMotion ? 0 : 1;
+      }
+    }
+
+    function flash(amount) {
+      flashEl.style.opacity = String(amount);
+    }
+
+    function ensureAudio() {
+      if (!audioCtx) {
+        const AC = window.AudioContext || window.webkitAudioContext;
+        if (!AC) return null;
+        audioCtx = new AC();
+        const seconds = 0.6;
+        noiseBuffer = audioCtx.createBuffer(1, Math.floor(audioCtx.sampleRate * seconds), audioCtx.sampleRate);
+        const data = noiseBuffer.getChannelData(0);
+        for (let i = 0; i < data.length; i++) data[i] = Math.random() * 2 - 1;
+      }
+      if (audioCtx.state === "suspended") audioCtx.resume();
+      return audioCtx;
+    }
+
+    function playSlash() {
+      const ac = ensureAudio();
+      if (!ac || !noiseBuffer) return;
+      const now = ac.currentTime;
+      const src = ac.createBufferSource();
+      src.buffer = noiseBuffer;
+      const filter = ac.createBiquadFilter();
+      filter.type = "bandpass";
+      filter.Q.value = 0.7;
+      filter.frequency.setValueAtTime(280, now);
+      filter.frequency.exponentialRampToValueAtTime(3200, now + 0.16);
+      filter.frequency.exponentialRampToValueAtTime(420, now + 0.55);
+      const gain = ac.createGain();
+      gain.gain.setValueAtTime(0.0001, now);
+      gain.gain.exponentialRampToValueAtTime(0.28, now + 0.05);
+      gain.gain.exponentialRampToValueAtTime(0.0001, now + 0.58);
+      src.connect(filter);
+      filter.connect(gain);
+      gain.connect(ac.destination);
+      src.start(now);
+      src.stop(now + 0.6);
+
+      const osc = ac.createOscillator();
+      osc.type = "sine";
+      const hit = now + SLASH_MS / 1000;
+      osc.frequency.setValueAtTime(120, hit);
+      osc.frequency.exponentialRampToValueAtTime(34, hit + 0.42);
+      const og = ac.createGain();
+      og.gain.setValueAtTime(0.0001, hit);
+      og.gain.exponentialRampToValueAtTime(0.45, hit + 0.03);
+      og.gain.exponentialRampToValueAtTime(0.0001, hit + 0.5);
+      osc.connect(og);
+      og.connect(ac.destination);
+      osc.start(hit);
+      osc.stop(hit + 0.52);
+    }
+
+    let lastHead = 0;
+    let lastTime = performance.now();
+    let locked = false;
+
+    window.__lockSlash = (next, nextHead, nextOpen) => {
+      locked = true;
+      phase = next;
+      head = nextHead;
+      open = nextOpen;
+      lastHead = nextHead;
+    };
+
+    function frame(now) {
+      const dt = Math.min(40, now - lastTime);
+      lastTime = now;
+      const elapsed = now - phaseStart;
+      if (locked) {
+        drawFrame(now, dt);
+        return;
+      }
+
+      if (phase === "calm" && elapsed > 700) enter("charge");
+      else if (phase === "charge" && elapsed > 520) enter("slash");
+      else if (phase === "slash") {
+        const u = clamp(elapsed / SLASH_MS, 0, 1);
+        head = easeOutExpo(u);
+        open = 1;
+        if (u >= 1) enter("hold");
+      } else if (phase === "hold") {
+        head = 1;
+        open = 1;
+        if (elapsed > HOLD_MS) enter("heal");
+      } else if (phase === "heal") {
+        head = 1;
+        open = 1 - easeInOut(clamp(elapsed / HEAL_MS, 0, 1));
+        if (elapsed > HEAL_MS) {
+          head = 0;
+          open = 0;
+          enter("calm");
+        }
+      } else {
+        head = 0;
+        open = 0;
+      }
+
+      if (phase === "slash" && head > lastHead) spawnAlong(lastHead, head);
+      if (phase === "hold" && Math.random() < 0.8) spawnEmbers();
+      lastHead = head;
+
+      drawFrame(now, dt);
+    }
+
+    function drawFrame(now, dt) {
+      titleEl.classList.toggle("show", phase === "hold" || phase === "heal");
+      const flashOpacity = parseFloat(flashEl.style.opacity || "0");
+      if (flashOpacity > 0.01) flashEl.style.opacity = String(flashOpacity * (reduceMotion ? 0.8 : 0.9));
+
+      drawSky(now);
+      ctx.setTransform(1, 0, 0, 1, 0, 0);
+      ctx.fillStyle = "#07091a";
+      ctx.fillRect(0, 0, w, h);
+      ctx.save();
+      if (shake > 0.02) {
+        const mag = shake * 8 * dpr;
+        ctx.translate((Math.random() - 0.5) * mag, (Math.random() - 0.5) * mag);
+        shake *= Math.pow(0.04, dt / 200);
+      } else {
+        shake = 0;
+      }
+      paintRift(now, false);
+      drawTornSky();
+      drawEdges();
+      drawCracks();
+      paintRift(now, true);
+      drawGround();
+      drawBlade();
+      drawParticles(dt);
+      ctx.restore();
+
+      window.__skySlash = { phase, head, open };
+      requestAnimationFrame(frame);
+    }
+
+    document.getElementById("again").addEventListener("click", () => {
+      soundArmed = true;
+      locked = false;
+      ensureAudio();
+      particles = [];
+      lastHead = 0;
+      head = 0;
+      open = 0;
+      enter("charge");
+    });
+
+    canvas.addEventListener("pointerdown", () => {
+      document.getElementById("again").click();
+    });
+
+    window.addEventListener("resize", resize);
+    resize();
+    requestAnimationFrame(frame);
+  </script>
+</body>
+</html>
